@@ -62,6 +62,12 @@ export interface Config {
   forwardGasReserveWei: bigint;
   /** Smallest spendable balance worth forwarding to the treasury. */
   forwardMinWei: bigint;
+  /** Telegram bot token from @BotFather; unset disables the tgbot command. */
+  telegramBotToken: string | undefined;
+  /** Chat id the bot answers to; unset means the first chat to message it becomes the owner. */
+  telegramChatId: number | undefined;
+  /** Central-wallet balance that triggers a low-funds telegram alert. */
+  lowBalanceAlertWei: bigint;
   /** Exit engine thresholds. */
   exit: {
     stopLossBps: number;
@@ -152,6 +158,9 @@ export function loadConfig(): Config {
     claimThresholdWei: parseEther(env('CLAIM_THRESHOLD_ETH') ?? '0.00002'),
     forwardGasReserveWei: parseEther(env('FORWARD_GAS_RESERVE_ETH') ?? '0.0003'),
     forwardMinWei: parseEther(env('FORWARD_MIN_ETH') ?? '0.0005'),
+    telegramBotToken: env('TELEGRAM_BOT_TOKEN'),
+    telegramChatId: env('TELEGRAM_CHAT_ID') ? envInt('TELEGRAM_CHAT_ID', 0) : undefined,
+    lowBalanceAlertWei: parseEther(env('LOW_BALANCE_ALERT_ETH') ?? '0.001'),
     exit: {
       stopLossBps: envInt('EXIT_STOP_LOSS_BPS', 6500),
       rung1MultipleBps: envInt('EXIT_RUNG1_MULTIPLE_BPS', 20000),

@@ -6,9 +6,9 @@ import { assertChainId, makePublicClient, makeWalletClient, robinhoodChain } fro
 import { loadConfig, type Config } from './config.js';
 import { BPS } from './core/curve.js';
 import { assertFeeRecipientPinned } from './core/guards.js';
-import { applyCloneOptions, resolveSourceMetadata } from './services/metadata.js';
-import { executeLaunch, planLaunch, simulateLaunch } from './services/launcher.js';
 import { harvest, readHarvestStatus } from './services/harvester.js';
+import { launchWith, spawnClone } from './services/spawn.js';
+import { runTgBot } from './services/tgbot.js';
 import { forwardToTreasury, fundJobWallet } from './services/forwarder.js';
 import { rankCurvesByVolume } from './services/discovery.js';
 import { WalletBook } from './state/wallets.js';
@@ -108,63 +108,6 @@ async function runLaunch(config: Config, source: Address, jobId: string): Promis
   if (!config.launcherKey) throw new Error('LAUNCHER_PRIVATE_KEY is required to launch');
   const journal = new Journal(config.stateDir);
   await launchWith(config, client, journal, config.launcherKey, source, jobId);
-}
-
-async function launchWith(
-  config: Config,
-  client: PublicClient,
-  journal: Journal,
-  key: Hex,
-  source: Address,
-  jobId: string,
-): Promise<boolean> {
-  const wallet = makeWalletClient(config, key);
-  const launcher = privateKeyToAccount(key).address;
-
-  const metadata = applyCloneOptions(await resolveSourceMetadata(client, source));
-  const plan = await planLaunch(client, config, { metadata, launcher });
-  journal.create(jobId, {
-    sourceToken: source,
-    name: metadata.name,
-    symbol: metadata.symbol,
-    launcher,
-    creatorFeeRecipient: config.creatorFeeRecipient,
-    state: 'METADATA_OK',
-  });
-
-  console.log('clone of          ', source, `-> ${metadata.name} (${metadata.symbol})`);
-  console.log('spend             ', eth(plan.totalValue), `= ${eth(plan.launchFee)} fee + ${eth(plan.quoteIn)} pre-buy`);
-  console.log('expected tokens   ', plan.expectedTokensOut.toString());
-  console.log('min tokens out    ', plan.minTokensOut.toString());
-  console.log('fee recipient     ', plan.creatorFeeRecipient);
-
-  const simulated = await simulateLaunch(client, config, plan);
-  console.log('simulated token   ', simulated.token, 'curve', simulated.curve);
-
-  if (config.dryRun) {
-    console.log('dry run: nothing sent. set DRY_RUN=false to broadcast.');
-    return false;
-  }
-
-  const result = await executeLaunch(client, wallet, config, journal, jobId, plan);
-  journal.update(jobId, {
-    state: 'HOLDING',
-    token: result.token,
-    curve: result.curve,
-    launchTxHash: result.txHash,
-    entryQuoteReserve: result.entryQuoteReserve.toString(),
-    tokensBought: result.tokensOut.toString(),
-    tokensSold: '0',
-    quoteRecovered: '0',
-    peakMultipleBps: BPS.toString(),
-    rungsFilled: [],
-  });
-  console.log('launched          ', result.token, 'curve', result.curve, 'tx', result.txHash);
-  console.log('tokens held       ', result.tokensOut.toString());
-  if (result.metadataMismatches.length > 0) {
-    console.log('metadata mismatch ', result.metadataMismatches);
-  }
-  return true;
 }
 
 async function runWatch(config: Config, jobId: string, ticks: number): Promise<void> {
@@ -322,6 +265,33 @@ async function runRound(config: Config, source: Address, jobId: string, maxSecon
   });
   console.log('refund to central ', refund.skipped ?? `${eth(refund.amount)} tx ${refund.txHash}`);
   journal.update(jobId, { state: stillHeld > 0n ? 'EXITING' : 'SETTLED' });
+}
+
+/** Spawn mode lives in services/spawn.ts so the telegram bot can share it. */
+async function runSpawn(config: Config, source: Address, jobId: string): Promise<void> {
+  await spawnClone(config, source, jobId);
+}
+
+/** Drains a job wallet's ETH back to the central launcher — for wallets stranded by a failed spawn. */
+async function runRefund(config: Config, jobId: string): Promise<void> {
+  const client = makePublicClient(config);
+  await assertChainId(client, config.chainId);
+  if (!config.launcherKey) throw new Error('LAUNCHER_PRIVATE_KEY is required to refund');
+  const book = new WalletBook(config.stateDir);
+  const jobWallet = book.get(jobId);
+  if (!jobWallet) throw new Error(`no job wallet for ${jobId} in ${book.path}`);
+  const centralAddress = privateKeyToAccount(config.launcherKey).address;
+  const journal = new Journal(config.stateDir);
+  const jobClient = makeWalletClient(config, jobWallet.privateKey);
+
+  const balance = await client.getBalance({ address: jobWallet.address });
+  console.log('job wallet        ', jobWallet.address, eth(balance));
+  const refund = await forwardToTreasury(client, jobClient, config, journal, jobId, {
+    refundTo: centralAddress,
+    gasReserve: 0n,
+    minForward: 0n,
+  });
+  console.log('refund to central ', refund.skipped ?? `${eth(refund.amount)} tx ${refund.txHash}`);
 }
 
 /**
@@ -510,6 +480,12 @@ async function main(): Promise<void> {
       return preflight(config);
     case 'quick':
       return runQuick(config, requireAddress(rest[0], 'source token'));
+    case 'spawn':
+      return runSpawn(
+        config,
+        requireAddress(rest[0], 'source token'),
+        rest[1] ?? `spawn-${Date.now()}`,
+      );
     case 'launch':
       return runLaunch(
         config,
@@ -531,6 +507,10 @@ async function main(): Promise<void> {
       );
     case 'rescue':
       return runRescue(config, rest[0] ?? '', requireAddress(rest[1], 'token'));
+    case 'refund':
+      return runRefund(config, rest[0] ?? '');
+    case 'tgbot':
+      return runTgBot(config);
     case 'discover':
       return runDiscover(config, rest[0] ? Number(rest[0]) : 10);
     case 'status':
@@ -542,6 +522,7 @@ async function main(): Promise<void> {
           '',
           '  preflight                     read-only wiring + funding check',
           '  quick <sourceToken>           normal mode: live clone-launch, prints token CA + link',
+          '  spawn <sourceToken> [jobId]   fresh wallet, launch-only (no pre-buy), refunds to central',
           '  launch <sourceToken> [jobId]  clone-launch with an atomic pre-buy',
           '  watch <jobId> [ticks]         run the exit engine',
           '  harvest <jobId>               sweep fees and claim as the delegated recipient',
@@ -549,6 +530,8 @@ async function main(): Promise<void> {
           '  round <sourceToken> [jobId] [maxSeconds]',
           '                                fresh job wallet -> fund -> launch -> exit within maxSeconds -> refund',
           '  rescue <jobId> <token>        sell + refund a position the journal lost (key from wallets.json)',
+          '  refund <jobId>                drain a job wallet\'s ETH back to the central launcher',
+          '  tgbot                         telegram bot: paste a CA in chat to spawn a clone',
           '  discover [top]                rank pons curves by recent trading volume',
           '  status [jobId]                job and on-chain state',
         ].join('\n'),

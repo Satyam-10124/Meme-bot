@@ -17,6 +17,7 @@ export const ALLOWED_SELECTORS = new Set<string>([
   '0x32f289cf', // claimToken(address)
   '0x1698755f', // claimToken(address,uint256)
   '0xf85f8e41', // launchAndBuy(...)
+  '0xf35abbcf', // launchToken(params,launchConfigId,pairToken)
   '0x3d61055e', // sweepPoolFees(bytes32,uint256,uint256)
   '0x3d3d2d58', // executeCreatorFeeRecipientChange(address)
   '0x095ea7b3', // approve(address,uint256)

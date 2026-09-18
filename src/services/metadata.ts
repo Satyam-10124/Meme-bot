@@ -12,7 +12,7 @@ export interface CloneOptions {
   nameSuffix: string;
 }
 
-export const DEFAULT_CLONE_OPTIONS: CloneOptions = { symbolSuffix: '2', nameSuffix: '' };
+export const DEFAULT_CLONE_OPTIONS: CloneOptions = { symbolSuffix: '', nameSuffix: '' };
 
 /**
  * Resolves the metadata of a source contract address. pons-launched tokens expose everything

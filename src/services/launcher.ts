@@ -84,11 +84,14 @@ export async function planLaunch(
 
   // The launch buy happens on a fresh curve, so the opening reserves are exactly the config.
   // The router exempts the buy recipient, so no snipe tax applies to this leg.
-  const { tokensOut } = quoteBuy(
-    { quote: launchConfig.phantomQuote, token: launchConfig.supply },
-    quoteIn,
-    { feeBps: launchConfig.curveFeeBps, creatorTaxBps: BigInt(config.creatorTaxBps) },
-  );
+  // A zero pre-buy skips the quote entirely and launches via factory launchToken instead.
+  const tokensOut = quoteIn > 0n
+    ? quoteBuy(
+        { quote: launchConfig.phantomQuote, token: launchConfig.supply },
+        quoteIn,
+        { feeBps: launchConfig.curveFeeBps, creatorTaxBps: BigInt(config.creatorTaxBps) },
+      ).tokensOut
+    : 0n;
 
   return {
     metadata: args.metadata,
@@ -140,12 +143,33 @@ export function encodeLaunchAndBuy(plan: LaunchPlan, config: Config): Hex {
   });
 }
 
+/** Launch-only calldata: factory launchToken, no buy leg. Used when preBuyWei is 0. */
+export function encodeLaunchOnly(plan: LaunchPlan, config: Config): Hex {
+  return encodeFunctionData({
+    abi: factoryAbi,
+    functionName: 'launchToken',
+    args: [buildTokenParams(plan, config), config.launchConfigId, NATIVE_QUOTE],
+  });
+}
+
 /** `eth_call` the exact calldata at the pending block. No transaction is ever sent blind. */
 export async function simulateLaunch(
   client: PublicClient,
   config: Config,
   plan: LaunchPlan,
 ): Promise<{ token: Address; curve: Address; tokensOut: bigint }> {
+  if (plan.quoteIn === 0n) {
+    const { result } = await client.simulateContract({
+      address: PONS_V2.factory,
+      abi: factoryAbi,
+      functionName: 'launchToken',
+      args: [buildTokenParams(plan, config), config.launchConfigId, NATIVE_QUOTE],
+      value: plan.totalValue,
+      account: plan.launcher,
+    });
+    const [token, curve] = result as readonly [Address, Address];
+    return { token, curve, tokensOut: 0n };
+  }
   const { result } = await client.simulateContract({
     address: PONS_V2.launchAndBuyRouter,
     abi: routerAbi,
@@ -174,29 +198,40 @@ export async function executeLaunch(
   jobId: string,
   plan: LaunchPlan,
 ): Promise<LaunchResult> {
-  const data = encodeLaunchAndBuy(plan, config);
-  assertAllowedTx(config, { to: PONS_V2.launchAndBuyRouter, data, value: plan.totalValue });
+  const launchOnly = plan.quoteIn === 0n;
+  const target = launchOnly ? PONS_V2.factory : PONS_V2.launchAndBuyRouter;
+  const data = launchOnly ? encodeLaunchOnly(plan, config) : encodeLaunchAndBuy(plan, config);
+  assertAllowedTx(config, { to: target, data, value: plan.totalValue });
 
   const simulated = await simulateLaunch(client, config, plan);
-  const gas = await client.estimateContractGas({
-    address: PONS_V2.launchAndBuyRouter,
-    abi: routerAbi,
-    functionName: 'launchAndBuy',
-    args: [
-      buildTokenParams(plan, config),
-      config.launchConfigId,
-      NATIVE_QUOTE,
-      plan.quoteIn,
-      plan.minTokensOut,
-      plan.recipient,
-      [],
-    ],
-    value: plan.totalValue,
-    account: plan.launcher,
-  });
+  const gas = launchOnly
+    ? await client.estimateContractGas({
+        address: PONS_V2.factory,
+        abi: factoryAbi,
+        functionName: 'launchToken',
+        args: [buildTokenParams(plan, config), config.launchConfigId, NATIVE_QUOTE],
+        value: plan.totalValue,
+        account: plan.launcher,
+      })
+    : await client.estimateContractGas({
+        address: PONS_V2.launchAndBuyRouter,
+        abi: routerAbi,
+        functionName: 'launchAndBuy',
+        args: [
+          buildTokenParams(plan, config),
+          config.launchConfigId,
+          NATIVE_QUOTE,
+          plan.quoteIn,
+          plan.minTokensOut,
+          plan.recipient,
+          [],
+        ],
+        value: plan.totalValue,
+        account: plan.launcher,
+      });
 
-  journal.intent(jobId, 'launchAndBuy', {
-    to: PONS_V2.launchAndBuyRouter,
+  journal.intent(jobId, launchOnly ? 'launchToken' : 'launchAndBuy', {
+    to: target,
     value: plan.totalValue.toString(),
     predictedToken: simulated.token,
     creatorFeeRecipient: plan.creatorFeeRecipient,
@@ -208,7 +243,7 @@ export async function executeLaunch(
   const txHash = await wallet.sendTransaction({
     account,
     chain: wallet.chain ?? null,
-    to: PONS_V2.launchAndBuyRouter,
+    to: target,
     data,
     value: plan.totalValue,
     gas: (gas * config.gasMultiplierPercent) / 100n,
