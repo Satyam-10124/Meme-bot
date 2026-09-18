@@ -67,6 +67,27 @@ describe('treasury transfer guard', () => {
     ).toThrow(/calldata/);
   });
 
+  it('allows funding an own job wallet only under the per-job cap', () => {
+    const jobWallet = '0x2222222222222222222222222222222222222222';
+    expect(() =>
+      assertAllowedTx(config, { to: jobWallet, value: parseEther('0.001'), transfer: true, ownWallet: jobWallet }),
+    ).not.toThrow();
+    expect(() =>
+      assertAllowedTx(config, { to: jobWallet, value: parseEther('1'), transfer: true, ownWallet: jobWallet }),
+    ).toThrow(/spend cap/);
+  });
+
+  it('does not let ownWallet whitelist a different destination', () => {
+    expect(() =>
+      assertAllowedTx(config, {
+        to: '0x3333333333333333333333333333333333333333',
+        value: 1n,
+        transfer: true,
+        ownWallet: '0x2222222222222222222222222222222222222222',
+      }),
+    ).toThrow(/allowlist/);
+  });
+
   it('still caps non-transfer value sends', () => {
     expect(() =>
       assertAllowedTx(config, { to: config.treasury, value: parseEther('1') }),

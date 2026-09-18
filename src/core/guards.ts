@@ -32,6 +32,11 @@ export interface TxIntent {
   token?: Address;
   /** Plain native transfer to the treasury; exempt from the per-job spend cap, nothing else is. */
   transfer?: boolean;
+  /**
+   * A wallet the bot itself controls (a job wallet from the wallet book, or the central
+   * launcher). Transfers to it stay under the per-job spend cap; nothing else may target it.
+   */
+  ownWallet?: Address;
 }
 
 export class GuardError extends Error {}
@@ -48,6 +53,7 @@ export function assertAllowedTx(config: Config, intent: TxIntent): void {
   ]);
   if (intent.curve) allowedDestinations.add(getAddress(intent.curve));
   if (intent.token) allowedDestinations.add(getAddress(intent.token));
+  if (intent.transfer && intent.ownWallet) allowedDestinations.add(getAddress(intent.ownWallet));
 
   if (!allowedDestinations.has(to)) {
     throw new GuardError(`destination ${to} is not in the allowlist`);
@@ -59,13 +65,19 @@ export function assertAllowedTx(config: Config, intent: TxIntent): void {
     }
   }
   if (intent.transfer) {
-    if (to !== getAddress(config.treasury)) {
-      throw new GuardError(`transfers may only target the treasury, not ${to}`);
-    }
     if (intent.data && intent.data !== '0x') {
       throw new GuardError('treasury transfers must carry no calldata');
     }
-    return;
+    if (to === getAddress(config.treasury)) return;
+    if (intent.ownWallet && to === getAddress(intent.ownWallet)) {
+      if (intent.value > config.profile.maxJobSpendWei) {
+        throw new GuardError(
+          `wallet funding ${intent.value} exceeds per-job spend cap ${config.profile.maxJobSpendWei}`,
+        );
+      }
+      return;
+    }
+    throw new GuardError(`transfers may only target the treasury or an own wallet, not ${to}`);
   }
   if (intent.value > config.profile.maxJobSpendWei) {
     throw new GuardError(

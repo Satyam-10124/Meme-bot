@@ -1,5 +1,5 @@
 #!/usr/bin/env tsx
-import { formatEther, getAddress, isAddress, type Address } from 'viem';
+import { formatEther, getAddress, isAddress, type Address, type Hex, type PublicClient } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { PONS_V2 } from './chain/addresses.js';
 import { assertChainId, makePublicClient, makeWalletClient } from './chain/clients.js';
@@ -9,7 +9,9 @@ import { assertFeeRecipientPinned } from './core/guards.js';
 import { applyCloneOptions, resolveSourceMetadata } from './services/metadata.js';
 import { executeLaunch, planLaunch, simulateLaunch } from './services/launcher.js';
 import { harvest, readHarvestStatus } from './services/harvester.js';
-import { forwardToTreasury } from './services/forwarder.js';
+import { forwardToTreasury, fundJobWallet } from './services/forwarder.js';
+import { rankCurvesByVolume } from './services/discovery.js';
+import { WalletBook } from './state/wallets.js';
 import {
   canLaunch,
   getLaunchedToken,
@@ -17,7 +19,7 @@ import {
   readLaunchConfig,
   readProtocolState,
 } from './services/protocol.js';
-import { runExitTick } from './services/trader.js';
+import { runExitTick, sellInTranches } from './services/trader.js';
 import { Journal } from './state/journal.js';
 import { erc20Abi, escrowAbi } from './chain/abis.js';
 
@@ -100,9 +102,20 @@ async function runLaunch(config: Config, source: Address, jobId: string): Promis
   const client = makePublicClient(config);
   await assertChainId(client, config.chainId);
   if (!config.launcherKey) throw new Error('LAUNCHER_PRIVATE_KEY is required to launch');
-  const wallet = makeWalletClient(config, config.launcherKey);
-  const launcher = privateKeyToAccount(config.launcherKey).address;
   const journal = new Journal(config.stateDir);
+  await launchWith(config, client, journal, config.launcherKey, source, jobId);
+}
+
+async function launchWith(
+  config: Config,
+  client: PublicClient,
+  journal: Journal,
+  key: Hex,
+  source: Address,
+  jobId: string,
+): Promise<boolean> {
+  const wallet = makeWalletClient(config, key);
+  const launcher = privateKeyToAccount(key).address;
 
   const metadata = applyCloneOptions(await resolveSourceMetadata(client, source));
   const plan = await planLaunch(client, config, { metadata, launcher });
@@ -126,7 +139,7 @@ async function runLaunch(config: Config, source: Address, jobId: string): Promis
 
   if (config.dryRun) {
     console.log('dry run: nothing sent. set DRY_RUN=false to broadcast.');
-    return;
+    return false;
   }
 
   const result = await executeLaunch(client, wallet, config, journal, jobId, plan);
@@ -147,27 +160,70 @@ async function runLaunch(config: Config, source: Address, jobId: string): Promis
   if (result.metadataMismatches.length > 0) {
     console.log('metadata mismatch ', result.metadataMismatches);
   }
+  return true;
 }
 
 async function runWatch(config: Config, jobId: string, ticks: number): Promise<void> {
   const client = makePublicClient(config);
   await assertChainId(client, config.chainId);
   const journal = new Journal(config.stateDir);
+  const book = new WalletBook(config.stateDir);
+  const key = book.get(jobId)?.privateKey ?? config.launcherKey;
+  if (!key) throw new Error('LAUNCHER_PRIVATE_KEY is required to exit');
+  const wallet = makeWalletClient(config, key);
+  const soldTotal = await watchWith(config, client, journal, key, jobId, { ticks });
+  if (soldTotal > 0n) {
+    const forwarded = await forwardToTreasury(client, wallet, config, journal, jobId);
+    console.log('forward           ', forwarded.skipped ?? `${eth(forwarded.amount)} tx ${forwarded.txHash}`);
+  }
+}
+
+async function heldBalance(client: PublicClient, token: Address, holder: Address): Promise<bigint> {
+  return client.readContract({ address: token, abi: erc20Abi, functionName: 'balanceOf', args: [holder] });
+}
+
+/**
+ * Runs exit ticks every 5s until `ticks` elapse, the position is flat, or `deadlineMs`
+ * passes; at the deadline whatever is still held is sold outright so a test round never
+ * leaves the pre-buy stranded. Returns the tokens sold.
+ */
+async function watchWith(
+  config: Config,
+  client: PublicClient,
+  journal: Journal,
+  key: Hex,
+  jobId: string,
+  opts: { ticks: number; deadlineMs?: number },
+): Promise<bigint> {
   const job = journal.get(jobId);
   if (!job?.token || !job.curve || !job.entryQuoteReserve) throw new Error(`job ${jobId} has no position`);
-  if (!config.launcherKey) throw new Error('LAUNCHER_PRIVATE_KEY is required to exit');
-  const wallet = makeWalletClient(config, config.launcherKey);
-  const holder = privateKeyToAccount(config.launcherKey).address;
+  const wallet = makeWalletClient(config, key);
+  const holder = privateKeyToAccount(key).address;
 
   const originallyBought = BigInt(job.tokensBought ?? '0');
   let soldTotal = 0n;
-  for (let tick = 0; tick < ticks; tick += 1) {
-    const held = await client.readContract({
-      address: job.token,
-      abi: erc20Abi,
-      functionName: 'balanceOf',
-      args: [holder],
-    });
+  for (let tick = 0; tick < opts.ticks; tick += 1) {
+    const held = await heldBalance(client, job.token, holder);
+    if (held === 0n && tick > 0) break;
+    if (opts.deadlineMs !== undefined && Date.now() >= opts.deadlineMs) {
+      const sells = await sellInTranches(client, wallet, config, journal, jobId, {
+        token: job.token,
+        curve: job.curve,
+        recipient: holder,
+        tokens: held,
+      });
+      const sold = sells.reduce((acc, s) => acc + s.tokensSold, 0n);
+      const quote = sells.reduce((acc, s) => acc + s.quoteOut, 0n);
+      soldTotal += sold;
+      const current = journal.get(jobId);
+      journal.update(jobId, {
+        tokensSold: (BigInt(current?.tokensSold ?? '0') + sold).toString(),
+        quoteRecovered: (BigInt(current?.quoteRecovered ?? '0') + quote).toString(),
+        state: 'EXITED',
+      });
+      console.log(`deadline          sold=${sold} quote=${eth(quote)} tranches=${sells.length}`);
+      break;
+    }
     const result = await runExitTick(client, wallet, config, journal, jobId, {
       token: job.token,
       curve: job.curve,
@@ -187,20 +243,91 @@ async function runWatch(config: Config, jobId: string, ticks: number): Promise<v
         `rule=${result.rule} sold=${soldNow} quote=${eth(quoteNow)}`,
     );
     const rungMatch = /ladder-rung-(\d)/.exec(result.rule);
+    const current = journal.get(jobId) ?? job;
     journal.update(jobId, {
       peakMultipleBps: result.peakMultipleBps.toString(),
-      tokensSold: (BigInt(job.tokensSold ?? '0') + soldNow).toString(),
-      quoteRecovered: (BigInt(job.quoteRecovered ?? '0') + quoteNow).toString(),
+      tokensSold: (BigInt(current.tokensSold ?? '0') + soldNow).toString(),
+      quoteRecovered: (BigInt(current.quoteRecovered ?? '0') + quoteNow).toString(),
       rungsFilled: rungMatch?.[1]
-        ? [...(job.rungsFilled ?? []), Number(rungMatch[1])]
-        : (job.rungsFilled ?? []),
+        ? [...(current.rungsFilled ?? []), Number(rungMatch[1])]
+        : (current.rungsFilled ?? []),
       state: result.rule === 'graduation-lockout' || soldNow > 0n ? 'EXITING' : 'HOLDING',
     });
-    if (tick < ticks - 1) await new Promise((r) => setTimeout(r, 5_000));
+    if (tick < opts.ticks - 1) await new Promise((r) => setTimeout(r, 5_000));
   }
-  if (soldTotal > 0n) {
-    const forwarded = await forwardToTreasury(client, wallet, config, journal, jobId);
-    console.log('forward           ', forwarded.skipped ?? `${eth(forwarded.amount)} tx ${forwarded.txHash}`);
+  return soldTotal;
+}
+
+/**
+ * One unattended test round on a disposable wallet: mint + fund the job wallet from the
+ * central launcher, launch-and-buy, run the exit engine for `maxSeconds` (force-selling at
+ * the deadline), then refund the job wallet's ETH to the launcher and forward the launcher's
+ * surplus above the round budget to the treasury.
+ */
+async function runRound(config: Config, source: Address, jobId: string, maxSeconds: number): Promise<void> {
+  const client = makePublicClient(config);
+  await assertChainId(client, config.chainId);
+  if (!config.launcherKey) throw new Error('LAUNCHER_PRIVATE_KEY is required for a round');
+  const central = makeWalletClient(config, config.launcherKey);
+  const centralAddress = privateKeyToAccount(config.launcherKey).address;
+  const journal = new Journal(config.stateDir);
+  const book = new WalletBook(config.stateDir);
+  const jobWallet = book.getOrCreate(jobId, centralAddress);
+  console.log('job wallet        ', jobWallet.address, `(key in ${book.path})`);
+
+  const protocol = await readProtocolState(client);
+  const budget = protocol.launchFee + config.profile.preBuyWei + config.profile.gasBufferWei;
+  const jobBalance = await client.getBalance({ address: jobWallet.address });
+  if (jobBalance < budget) {
+    const topUp = budget - jobBalance;
+    const fundTx = await fundJobWallet(client, central, config, journal, jobId, jobWallet.address, topUp);
+    console.log('funded            ', eth(topUp), fundTx ? `tx ${fundTx}` : '(dry run)');
+  }
+
+  const launched = await launchWith(config, client, journal, jobWallet.privateKey, source, jobId);
+  if (!launched) return;
+  const job = journal.get(jobId);
+  if (job?.token && job.curve) book.update(jobId, { token: job.token, curve: job.curve });
+
+  const deadlineMs = Date.now() + maxSeconds * 1000;
+  const ticks = Math.ceil(maxSeconds / 5) + 2;
+  const sold = await watchWith(config, client, journal, jobWallet.privateKey, jobId, { ticks, deadlineMs });
+  const stillHeld = job?.token ? await heldBalance(client, job.token, jobWallet.address) : 0n;
+  console.log('position          ', `sold=${sold} held=${stillHeld}`);
+
+  const jobClient = makeWalletClient(config, jobWallet.privateKey);
+  const refund = await forwardToTreasury(client, jobClient, config, journal, jobId, {
+    refundTo: centralAddress,
+    gasReserve: stillHeld > 0n ? config.forwardGasReserveWei : 0n,
+    minForward: config.forwardMinWei / 10n,
+  });
+  console.log('refund to central ', refund.skipped ?? `${eth(refund.amount)} tx ${refund.txHash}`);
+  journal.update(jobId, { state: stillHeld > 0n ? 'EXITING' : 'SETTLED' });
+}
+
+async function runDiscover(config: Config, top: number): Promise<void> {
+  const client = makePublicClient(config);
+  await assertChainId(client, config.chainId);
+  const ranked = await rankCurvesByVolume(client, {
+    launchLookbackBlocks: 200_000n,
+    volumeLookbackBlocks: 100_000n,
+  });
+  if (ranked.length === 0) {
+    console.log('no curve volume in window');
+    return;
+  }
+  for (const entry of ranked.slice(0, top)) {
+    const [name, symbol] = await Promise.all([
+      client.readContract({ address: entry.token, abi: erc20Abi, functionName: 'name' }),
+      client.readContract({ address: entry.token, abi: erc20Abi, functionName: 'symbol' }),
+    ]);
+    console.log(
+      entry.token,
+      `${name} (${symbol})`.padEnd(32),
+      `vol=${eth(entry.volumeWei)}`,
+      `net=${eth(entry.netFlowWei)}`,
+      `buys=${entry.buys} sells=${entry.sells}`,
+    );
   }
 }
 
@@ -293,6 +420,15 @@ async function main(): Promise<void> {
       return runHarvest(config, rest[0] ?? '');
     case 'forward':
       return runForward(config, rest[0] ?? 'forward');
+    case 'round':
+      return runRound(
+        config,
+        requireAddress(rest[0], 'sourceToken'),
+        rest[1] ?? `round-${Date.now()}`,
+        rest[2] ? Number(rest[2]) : 300,
+      );
+    case 'discover':
+      return runDiscover(config, rest[0] ? Number(rest[0]) : 10);
     case 'status':
       return runStatus(config, rest[0]);
     default:
@@ -305,6 +441,9 @@ async function main(): Promise<void> {
           '  watch <jobId> [ticks]         run the exit engine',
           '  harvest <jobId>               sweep fees and claim as the delegated recipient',
           '  forward [jobId]               send launcher balance above the gas reserve to the treasury',
+          '  round <sourceToken> [jobId] [maxSeconds]',
+          '                                fresh job wallet -> fund -> launch -> exit within maxSeconds -> refund',
+          '  discover [top]                rank pons curves by recent trading volume',
           '  status [jobId]                job and on-chain state',
         ].join('\n'),
       );

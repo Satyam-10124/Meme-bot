@@ -106,6 +106,46 @@ export async function approveExact(
   });
 }
 
+/**
+ * Sells `tokens` in impact-capped tranches (at most `maxTranchesPerTick`), re-reading the
+ * curve before each so a tranche is sized against the live reserves, not stale ones.
+ */
+export async function sellInTranches(
+  client: PublicClient,
+  wallet: WalletClient,
+  config: Config,
+  journal: Journal,
+  jobId: string,
+  args: { token: Address; curve: Address; recipient: Address; tokens: bigint },
+): Promise<SellExecution[]> {
+  const sells: SellExecution[] = [];
+  let remaining = args.tokens;
+  for (let i = 0; i < config.exit.maxTranchesPerTick && remaining > 0n; i += 1) {
+    const live = await readCurveState(client, args.curve);
+    if (live.readyToGraduate) break;
+    const sellable = remaining < live.sellableTokens ? remaining : live.sellableTokens;
+    if (sellable <= 0n) break;
+    const cap = maxTrancheForImpact(live.reserves, sellable, config.exit.maxTrancheImpactBps);
+    const tranche = cap > 0n ? cap : sellable;
+    if (config.dryRun) {
+      const fees = { feeBps: live.feeBps, creatorTaxBps: live.creatorTaxBps };
+      sells.push({
+        txHash: '0x' as Hex,
+        tokensSold: tranche,
+        quoteOut: quoteSell(live.reserves, tranche, fees).quoteOut,
+      });
+      remaining -= tranche;
+      continue;
+    }
+    await approveExact(client, wallet, config, args.token, args.curve, tranche);
+    sells.push(
+      await sellTranche(client, wallet, config, journal, jobId, args.curve, tranche, args.recipient, args.token),
+    );
+    remaining -= tranche;
+  }
+  return sells;
+}
+
 export interface TickResult {
   rule: string;
   multipleBps: bigint;
@@ -166,40 +206,15 @@ export async function runExitTick(
   };
 
   const decision = decideExit(config, inputs);
-  const sells: SellExecution[] = [];
-  if (decision.action === 'sell' && decision.tokens > 0n) {
-    let remaining = decision.tokens;
-    const fees = { feeBps: state.feeBps, creatorTaxBps: state.creatorTaxBps };
-    for (let i = 0; i < config.exit.maxTranchesPerTick && remaining > 0n; i += 1) {
-      const live = await readCurveState(client, args.curve);
-      const cap = maxTrancheForImpact(live.reserves, remaining, config.exit.maxTrancheImpactBps);
-      const tranche = cap > 0n ? cap : remaining;
-      if (config.dryRun) {
-        sells.push({
-          txHash: '0x' as Hex,
-          tokensSold: tranche,
-          quoteOut: quoteSell(live.reserves, tranche, fees).quoteOut,
-        });
-        remaining -= tranche;
-        continue;
-      }
-      await approveExact(client, wallet, config, args.token, args.curve, tranche);
-      sells.push(
-        await sellTranche(
-          client,
-          wallet,
-          config,
-          journal,
-          jobId,
-          args.curve,
-          tranche,
-          args.recipient,
-          args.token,
-        ),
-      );
-      remaining -= tranche;
-    }
-  }
+  const sells =
+    decision.action === 'sell' && decision.tokens > 0n
+      ? await sellInTranches(client, wallet, config, journal, jobId, {
+          token: args.token,
+          curve: args.curve,
+          recipient: args.recipient,
+          tokens: decision.tokens,
+        })
+      : [];
 
   return {
     rule: decision.rule,

@@ -53,8 +53,9 @@ export interface ForwardResult {
 }
 
 /**
- * Sends the launcher's spendable native balance to the pinned treasury. This is the only
- * value-bearing transfer the bot makes to a non-protocol address, and the destination is
+ * Sends the wallet's spendable native balance to the pinned treasury, or — for a disposable
+ * job wallet — back to the central wallet that funded it (`refundTo`). These are the only
+ * value-bearing transfers the bot makes to non-protocol addresses, and both destinations are
  * checked against the allowlist like every other send.
  */
 export async function forwardToTreasury(
@@ -63,12 +64,14 @@ export async function forwardToTreasury(
   config: Config,
   journal: Journal,
   jobId: string,
+  opts: { refundTo?: Address; gasReserve?: bigint; minForward?: bigint } = {},
 ): Promise<ForwardResult> {
   const account = wallet.account;
   if (!account) throw new Error('wallet client has no account');
   const from: Address = account.address;
-  const to = getAddress(config.treasury);
-  if (getAddress(from) === to) return { amount: 0n, skipped: 'launcher is the treasury' };
+  const refundTo = opts.refundTo;
+  const to = getAddress(refundTo ?? config.treasury);
+  if (getAddress(from) === to) return { amount: 0n, skipped: 'wallet is the destination' };
 
   const [balance, gasPrice] = await Promise.all([
     client.getBalance({ address: from }),
@@ -77,12 +80,17 @@ export async function forwardToTreasury(
   const plan = planForward({
     balance,
     gasPrice,
-    gasReserve: config.forwardGasReserveWei,
-    minForward: config.forwardMinWei,
+    gasReserve: opts.gasReserve ?? config.forwardGasReserveWei,
+    minForward: opts.minForward ?? config.forwardMinWei,
   });
   if (plan.amount === 0n) return { amount: 0n, skipped: plan.reason ?? 'nothing to forward' };
 
-  assertAllowedTx(config, { to, value: plan.amount, transfer: true });
+  assertAllowedTx(config, {
+    to,
+    value: plan.amount,
+    transfer: true,
+    ...(refundTo ? { ownWallet: refundTo } : {}),
+  });
   if (config.dryRun) {
     return { amount: plan.amount, skipped: 'dry run: forward not sent' };
   }
@@ -101,4 +109,50 @@ export async function forwardToTreasury(
   if (receipt.status !== 'success') throw new Error(`forward reverted: ${txHash}`);
   journal.intent(jobId, 'forwarded', { txHash, amount: plan.amount.toString() });
   return { txHash, amount: plan.amount };
+}
+
+/**
+ * Tops a fresh job wallet up from the central launcher with exactly the launch budget. The
+ * destination must be a wallet from the bot's own wallet book and the value stays under the
+ * per-job spend cap.
+ */
+export async function fundJobWallet(
+  client: PublicClient,
+  central: WalletClient,
+  config: Config,
+  journal: Journal,
+  jobId: string,
+  jobWallet: Address,
+  amount: bigint,
+): Promise<Hex | undefined> {
+  const account = central.account;
+  if (!account) throw new Error('wallet client has no account');
+  const to = getAddress(jobWallet);
+  assertAllowedTx(config, { to, value: amount, transfer: true, ownWallet: to });
+
+  const [balance, gasPrice] = await Promise.all([
+    client.getBalance({ address: account.address }),
+    client.getGasPrice(),
+  ]);
+  const maxFeePerGas = gasPrice * 2n;
+  const needed = amount + TRANSFER_GAS * maxFeePerGas + config.forwardGasReserveWei;
+  if (balance < needed) {
+    throw new Error(`central wallet holds ${balance} wei, needs ${needed} to fund ${to}`);
+  }
+  if (config.dryRun) return undefined;
+
+  journal.intent(jobId, 'fund', { from: account.address, to, amount: amount.toString() });
+  const txHash = await central.sendTransaction({
+    account,
+    chain: central.chain ?? null,
+    to,
+    value: amount,
+    gas: TRANSFER_GAS,
+    maxFeePerGas,
+    maxPriorityFeePerGas: gasPrice / 2n,
+  });
+  const receipt = await client.waitForTransactionReceipt({ hash: txHash });
+  if (receipt.status !== 'success') throw new Error(`funding reverted: ${txHash}`);
+  journal.intent(jobId, 'funded', { txHash, amount: amount.toString() });
+  return txHash;
 }
