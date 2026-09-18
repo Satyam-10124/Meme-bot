@@ -2,7 +2,7 @@
 import { formatEther, getAddress, isAddress, type Address, type Hex, type PublicClient } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { PONS_V2 } from './chain/addresses.js';
-import { assertChainId, makePublicClient, makeWalletClient } from './chain/clients.js';
+import { assertChainId, makePublicClient, makeWalletClient, robinhoodChain } from './chain/clients.js';
 import { loadConfig, type Config } from './config.js';
 import { BPS } from './core/curve.js';
 import { assertFeeRecipientPinned } from './core/guards.js';
@@ -27,6 +27,8 @@ function requireAddress(value: string | undefined, label: string): Address {
   if (!value || !isAddress(value)) throw new Error(`${label} must be an address`);
   return getAddress(value);
 }
+
+const EXPLORER = robinhoodChain.blockExplorers.default.url;
 
 function eth(value: bigint): string {
   return `${formatEther(value)} ETH`;
@@ -305,6 +307,35 @@ async function runRound(config: Config, source: Address, jobId: string, maxSecon
   journal.update(jobId, { state: stillHeld > 0n ? 'EXITING' : 'SETTLED' });
 }
 
+/**
+ * Normal mode: paste a CA, get a clone launched from the central launcher with the pre-buy
+ * and creator fees delegated to the treasury. Broadcasts unless DRY_RUN=true is set explicitly;
+ * prints only the new token CA, explorer link and tx so it can be piped or pasted.
+ */
+async function runQuick(config: Config, source: Address): Promise<void> {
+  const live = process.env['DRY_RUN'] !== 'true';
+  const quickConfig: Config = { ...config, dryRun: !live };
+  const client = makePublicClient(quickConfig);
+  await assertChainId(client, quickConfig.chainId);
+  if (!quickConfig.launcherKey) throw new Error('LAUNCHER_PRIVATE_KEY is required to launch');
+  const journal = new Journal(quickConfig.stateDir);
+  const jobId = `quick-${Date.now()}`;
+  const started = Date.now();
+  const launched = await launchWith(quickConfig, client, journal, quickConfig.launcherKey, source, jobId);
+  const job = journal.get(jobId);
+  if (!launched || !job?.token) {
+    console.log('dry run only; set DRY_RUN=false (or unset) to broadcast');
+    return;
+  }
+  console.log('');
+  console.log('TOKEN CA          ', job.token);
+  console.log('TOKEN LINK        ', `${EXPLORER}/token/${job.token}`);
+  console.log('LAUNCH TX         ', `${EXPLORER}/tx/${job.launchTxHash}`);
+  console.log('FEES TO           ', quickConfig.creatorFeeRecipient);
+  console.log('JOB               ', jobId, `(${((Date.now() - started) / 1000).toFixed(1)}s)`);
+  console.log('next              ', `npm run bot -- watch ${jobId}   # auto-sell + forward proceeds`);
+}
+
 async function runDiscover(config: Config, top: number): Promise<void> {
   const client = makePublicClient(config);
   await assertChainId(client, config.chainId);
@@ -408,6 +439,8 @@ async function main(): Promise<void> {
   switch (command) {
     case 'preflight':
       return preflight(config);
+    case 'quick':
+      return runQuick(config, requireAddress(rest[0], 'source token'));
     case 'launch':
       return runLaunch(
         config,
@@ -437,6 +470,7 @@ async function main(): Promise<void> {
           'usage: npm run bot -- <command>',
           '',
           '  preflight                     read-only wiring + funding check',
+          '  quick <sourceToken>           normal mode: live clone-launch, prints token CA + link',
           '  launch <sourceToken> [jobId]  clone-launch with an atomic pre-buy',
           '  watch <jobId> [ticks]         run the exit engine',
           '  harvest <jobId>               sweep fees and claim as the delegated recipient',

@@ -65,6 +65,30 @@ npm run bot -- harvest rh-experiment-1
 npm run bot -- forward rh-experiment-1
 ```
 
+## Normal mode: `quick <CA>`
+
+Paste a CA, get a clone. `quick` launches live from the central launcher (set `DRY_RUN=true`
+to only simulate), pins creator fees to the treasury, and prints the new token CA, explorer
+link and tx:
+
+```bash
+npm run bot -- quick 0xSourceToken
+npm run bot -- watch quick-<id>     # deterministic auto-sell of the pre-buy, then forward
+```
+
+## Test rounds: `discover` + `round`
+
+```bash
+npm run bot -- discover 5                          # top native-ETH pons curves by volume
+DRY_RUN=false PRE_BUY_ETH=0.0005 npm run bot -- round 0xSourceToken round-1 300
+```
+
+`round` mints a fresh job wallet (key saved to `.pons-state/wallets.json`, mode 0600,
+gitignored — never in `.env`), funds it from the launcher with launch fee + pre-buy + gas,
+launch-and-buys, runs the exit engine, force-sells whatever is still held at `maxSeconds`,
+and refunds the job wallet's ETH to the launcher. If a round crashes, `watch <jobId>` picks up
+the same job wallet from the JSON book.
+
 ## Fee flow
 
 ```
