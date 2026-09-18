@@ -43,7 +43,26 @@ npm run bot -- status
 ```
 
 Suggested first live run: keep `micro`, launch once, watch it, then harvest. Fund the launcher
-with ~0.002 ETH.
+with ~0.002 ETH. For the requested experiment, use source token
+`0x35b8b49c9c4e7a5d08dc1ba0ea5eac0b9937bc83`.
+
+The generated launcher wallet is printed separately by Devin; fund only that address with the
+micro budget. The creator-fee treasury/claimer is fixed to
+`0x0A06b2bDb8daf62fc828a792fc40B0B7538D1A5B`. Automated claims require the private key for that
+exact address; without it, sweeping still works but fees remain claimable in escrow.
+
+Example:
+
+```bash
+cp .env.example .env
+# set LAUNCHER_PRIVATE_KEY and, only if you control the delegated treasury,
+# CLAIMER_PRIVATE_KEY; keep DRY_RUN=true for the first simulation.
+npm run bot -- preflight
+npm run bot -- launch 0x35b8b49c9c4e7a5d08dc1ba0ea5eac0b9937bc83 rh-experiment-1
+DRY_RUN=false npm run bot -- launch 0x35b8b49c9c4e7a5d08dc1ba0ea5eac0b9937bc83 rh-experiment-1
+npm run bot -- watch rh-experiment-1 120
+npm run bot -- harvest rh-experiment-1
+```
 
 ## Fee flow
 
