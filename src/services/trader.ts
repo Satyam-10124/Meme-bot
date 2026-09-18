@@ -98,12 +98,15 @@ export async function approveExact(
 
   const data = encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [curve, amount] });
   assertAllowedTx(config, { to: token, data, value: 0n, token });
-  return wallet.sendTransaction({
+  const hash = await wallet.sendTransaction({
     account,
     chain: wallet.chain ?? null,
     to: token,
     data,
   });
+  const receipt = await client.waitForTransactionReceipt({ hash });
+  if (receipt.status !== 'success') throw new Error(`approve reverted: ${hash}`);
+  return hash;
 }
 
 /**

@@ -28,6 +28,7 @@ function requireAddress(value: string | undefined, label: string): Address {
   return getAddress(value);
 }
 
+const ROUND_GAS_UNITS = 10_000_000n;
 const EXPLORER = robinhoodChain.blockExplorers.default.url;
 
 function eth(value: bigint): string {
@@ -226,17 +227,25 @@ async function watchWith(
       console.log(`deadline          sold=${sold} quote=${eth(quote)} tranches=${sells.length}`);
       break;
     }
-    const result = await runExitTick(client, wallet, config, journal, jobId, {
-      token: job.token,
-      curve: job.curve,
-      recipient: holder,
-      entryQuoteReserve: BigInt(job.entryQuoteReserve),
-      tokensHeld: held,
-      tokensBoughtOriginally: originallyBought,
-      tradableAllocation: originallyBought,
-      peakMultipleBps: BigInt(job.peakMultipleBps ?? BPS.toString()),
-      rungsFilled: job.rungsFilled ?? [],
-    });
+    let result: Awaited<ReturnType<typeof runExitTick>>;
+    try {
+      result = await runExitTick(client, wallet, config, journal, jobId, {
+        token: job.token,
+        curve: job.curve,
+        recipient: holder,
+        entryQuoteReserve: BigInt(job.entryQuoteReserve),
+        tokensHeld: held,
+        tokensBoughtOriginally: originallyBought,
+        tradableAllocation: originallyBought,
+        peakMultipleBps: BigInt(job.peakMultipleBps ?? BPS.toString()),
+        rungsFilled: job.rungsFilled ?? [],
+      });
+    } catch (err) {
+      // Public RPC hiccups must not abandon a live position; the next tick re-reads everything.
+      console.log(`tick ${tick} rpc error, retrying:`, err instanceof Error ? err.message.split('\n')[0] : err);
+      await new Promise((r) => setTimeout(r, 5_000));
+      continue;
+    }
     const soldNow = result.sells.reduce((acc, s) => acc + s.tokensSold, 0n);
     const quoteNow = result.sells.reduce((acc, s) => acc + s.quoteOut, 0n);
     soldTotal += soldNow;
@@ -277,16 +286,23 @@ async function runRound(config: Config, source: Address, jobId: string, maxSecon
   const jobWallet = book.getOrCreate(jobId, centralAddress);
   console.log('job wallet        ', jobWallet.address, `(key in ${book.path})`);
 
-  const protocol = await readProtocolState(client);
-  const budget = protocol.launchFee + config.profile.preBuyWei + config.profile.gasBufferWei;
+  const existing = journal.get(jobId);
+  const resuming = Boolean(existing?.token && existing.curve && existing.launchTxHash);
+  if (resuming) console.log('resuming          ', existing?.token, '(already launched)');
+
+  const [protocol, gasPrice] = await Promise.all([readProtocolState(client), client.getGasPrice()]);
+  // launchAndBuy alone estimates ~5M gas on Robinhood; cover it plus sells and the refund at the live price.
+  const liveGasBuffer = ROUND_GAS_UNITS * gasPrice;
+  const gasBuffer = liveGasBuffer > config.profile.gasBufferWei ? liveGasBuffer : config.profile.gasBufferWei;
+  const budget = protocol.launchFee + config.profile.preBuyWei + gasBuffer;
   const jobBalance = await client.getBalance({ address: jobWallet.address });
-  if (jobBalance < budget) {
+  if (!resuming && jobBalance < budget) {
     const topUp = budget - jobBalance;
     const fundTx = await fundJobWallet(client, central, config, journal, jobId, jobWallet.address, topUp);
     console.log('funded            ', eth(topUp), fundTx ? `tx ${fundTx}` : '(dry run)');
   }
 
-  const launched = await launchWith(config, client, journal, jobWallet.privateKey, source, jobId);
+  const launched = resuming || (await launchWith(config, client, journal, jobWallet.privateKey, source, jobId));
   if (!launched) return;
   const job = journal.get(jobId);
   if (job?.token && job.curve) book.update(jobId, { token: job.token, curve: job.curve });

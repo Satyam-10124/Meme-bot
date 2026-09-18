@@ -23,10 +23,13 @@ export const robinhoodChain = defineChain({
   },
 });
 
+/** The public Robinhood RPC rate-limits bursts (429) and times out under load; back off hard. */
+const RPC_HTTP_OPTIONS = { timeout: 20_000, retryCount: 8, retryDelay: 1_000 } as const;
+
 export function makePublicClient(config: Config): PublicClient {
   return createPublicClient({
     chain: robinhoodChain,
-    transport: fallback(config.rpcUrls.map((url) => http(url, { timeout: 20_000 }))),
+    transport: fallback(config.rpcUrls.map((url) => http(url, RPC_HTTP_OPTIONS))),
   }) as PublicClient;
 }
 
@@ -45,7 +48,7 @@ export function makeWalletClient(config: Config, key: Hex): WalletClient {
   return createWalletClient({
     account: privateKeyToAccount(key),
     chain: robinhoodChain,
-    transport: fallback(config.rpcUrls.map((url) => http(url, { timeout: 20_000 }))),
+    transport: fallback(config.rpcUrls.map((url) => http(url, RPC_HTTP_OPTIONS))),
   });
 }
 
