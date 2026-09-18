@@ -246,6 +246,8 @@ export async function executeLaunch(
     }
   }
   if (!token || !curve) throw new Error(`launch receipt ${txHash} has no TokenLaunched event`);
+  // Persist the position the moment it exists on-chain; any read below may fail on a flaky RPC.
+  journal.update(jobId, { token, curve, tokensBought: tokensOut.toString(), state: 'HOLDING' });
 
   const [record, curveState, actualMetadata] = await Promise.all([
     getLaunchedToken(client, token),

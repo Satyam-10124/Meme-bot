@@ -29,6 +29,7 @@ function requireAddress(value: string | undefined, label: string): Address {
 }
 
 const ROUND_GAS_UNITS = 10_000_000n;
+const RESCUE_GAS_UNITS = 3_000_000n;
 const EXPLORER = robinhoodChain.blockExplorers.default.url;
 
 function eth(value: bigint): string {
@@ -324,6 +325,58 @@ async function runRound(config: Config, source: Address, jobId: string, maxSecon
 }
 
 /**
+ * Recovers a position the journal lost track of (e.g. a crash between the launch receipt and
+ * the journal write): given the job wallet's id and the token it holds, tops the wallet up with
+ * gas from the launcher if needed, sells everything on the curve, and refunds the ETH.
+ */
+async function runRescue(config: Config, jobId: string, token: Address): Promise<void> {
+  const client = makePublicClient(config);
+  await assertChainId(client, config.chainId);
+  if (!config.launcherKey) throw new Error('LAUNCHER_PRIVATE_KEY is required to rescue');
+  const book = new WalletBook(config.stateDir);
+  const jobWallet = book.get(jobId);
+  if (!jobWallet) throw new Error(`no job wallet for ${jobId} in ${book.path}`);
+  const journal = new Journal(config.stateDir);
+  const central = makeWalletClient(config, config.launcherKey);
+  const centralAddress = privateKeyToAccount(config.launcherKey).address;
+  const rescueId = `${jobId}-rescue-${token.slice(2, 8)}`;
+
+  const record = await getLaunchedToken(client, token);
+  if (!record.exists) throw new Error(`${token} is not a pons token`);
+  const held = await heldBalance(client, token, jobWallet.address);
+  console.log('job wallet        ', jobWallet.address, 'holds', held.toString(), 'of', token);
+  journal.create(rescueId, { launcher: jobWallet.address, token, curve: record.curve, state: 'EXITING' });
+  if (held > 0n) {
+    const [gasPrice, balance] = await Promise.all([client.getGasPrice(), client.getBalance({ address: jobWallet.address })]);
+    const gasNeeded = RESCUE_GAS_UNITS * gasPrice;
+    if (balance < gasNeeded) {
+      const tx = await fundJobWallet(client, central, config, journal, rescueId, jobWallet.address, gasNeeded - balance);
+      console.log('gas top-up        ', eth(gasNeeded - balance), tx ? `tx ${tx}` : '(dry run)');
+    }
+    const jobClient = makeWalletClient(config, jobWallet.privateKey);
+    const sells = await sellInTranches(client, jobClient, config, journal, rescueId, {
+      token,
+      curve: record.curve,
+      recipient: jobWallet.address,
+      tokens: held,
+    });
+    const sold = sells.reduce((acc, s) => acc + s.tokensSold, 0n);
+    const quote = sells.reduce((acc, s) => acc + s.quoteOut, 0n);
+    console.log('sold              ', sold.toString(), 'for', eth(quote), `in ${sells.length} tranche(s)`);
+    journal.update(rescueId, { tokensSold: sold.toString(), quoteRecovered: quote.toString(), state: 'EXITED' });
+  }
+  const remaining = await heldBalance(client, token, jobWallet.address);
+  const jobClient = makeWalletClient(config, jobWallet.privateKey);
+  const refund = await forwardToTreasury(client, jobClient, config, journal, rescueId, {
+    refundTo: centralAddress,
+    gasReserve: 0n,
+    minForward: config.forwardMinWei / 10n,
+  });
+  console.log('refund to central ', refund.skipped ?? `${eth(refund.amount)} tx ${refund.txHash}`);
+  journal.update(rescueId, { state: remaining > 0n ? 'EXITING' : 'SETTLED' });
+}
+
+/**
  * Normal mode: paste a CA, get a clone launched from the central launcher with the pre-buy
  * and creator fees delegated to the treasury. Broadcasts unless DRY_RUN=true is set explicitly;
  * prints only the new token CA, explorer link and tx so it can be piped or pasted.
@@ -476,6 +529,8 @@ async function main(): Promise<void> {
         rest[1] ?? `round-${Date.now()}`,
         rest[2] ? Number(rest[2]) : 300,
       );
+    case 'rescue':
+      return runRescue(config, rest[0] ?? '', requireAddress(rest[1], 'token'));
     case 'discover':
       return runDiscover(config, rest[0] ? Number(rest[0]) : 10);
     case 'status':
@@ -493,6 +548,7 @@ async function main(): Promise<void> {
           '  forward [jobId]               send launcher balance above the gas reserve to the treasury',
           '  round <sourceToken> [jobId] [maxSeconds]',
           '                                fresh job wallet -> fund -> launch -> exit within maxSeconds -> refund',
+          '  rescue <jobId> <token>        sell + refund a position the journal lost (key from wallets.json)',
           '  discover [top]                rank pons curves by recent trading volume',
           '  status [jobId]                job and on-chain state',
         ].join('\n'),
