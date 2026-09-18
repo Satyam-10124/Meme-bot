@@ -58,6 +58,10 @@ export interface Config {
   /** Harvester thresholds, all in wei of the quote asset. */
   sweepThresholdWei: bigint;
   claimThresholdWei: bigint;
+  /** Native ETH kept in the launcher after a treasury forward, for future gas. */
+  forwardGasReserveWei: bigint;
+  /** Smallest spendable balance worth forwarding to the treasury. */
+  forwardMinWei: bigint;
   /** Exit engine thresholds. */
   exit: {
     stopLossBps: number;
@@ -146,6 +150,8 @@ export function loadConfig(): Config {
     stateDir: env('STATE_DIR') ?? '.pons-state',
     sweepThresholdWei: parseEther(env('SWEEP_THRESHOLD_ETH') ?? '0.00002'),
     claimThresholdWei: parseEther(env('CLAIM_THRESHOLD_ETH') ?? '0.00002'),
+    forwardGasReserveWei: parseEther(env('FORWARD_GAS_RESERVE_ETH') ?? '0.0003'),
+    forwardMinWei: parseEther(env('FORWARD_MIN_ETH') ?? '0.0005'),
     exit: {
       stopLossBps: envInt('EXIT_STOP_LOSS_BPS', 6500),
       rung1MultipleBps: envInt('EXIT_RUNG1_MULTIPLE_BPS', 20000),

@@ -9,6 +9,7 @@ import { assertFeeRecipientPinned } from './core/guards.js';
 import { applyCloneOptions, resolveSourceMetadata } from './services/metadata.js';
 import { executeLaunch, planLaunch, simulateLaunch } from './services/launcher.js';
 import { harvest, readHarvestStatus } from './services/harvester.js';
+import { forwardToTreasury } from './services/forwarder.js';
 import {
   canLaunch,
   getLaunchedToken,
@@ -61,6 +62,10 @@ async function preflight(config: Config): Promise<void> {
   console.log('creator tax       ', `${config.creatorTaxBps} bps`);
   console.log('fee recipient     ', config.creatorFeeRecipient, '(delegated claimer)');
   console.log('dry run           ', config.dryRun);
+  console.log('treasury          ', config.treasury, {
+    gasReserve: eth(config.forwardGasReserveWei),
+    minForward: eth(config.forwardMinWei),
+  });
 
   const escrowBalance = await client.readContract({
     address: PONS_V2.feeEscrow,
@@ -155,6 +160,7 @@ async function runWatch(config: Config, jobId: string, ticks: number): Promise<v
   const holder = privateKeyToAccount(config.launcherKey).address;
 
   const originallyBought = BigInt(job.tokensBought ?? '0');
+  let soldTotal = 0n;
   for (let tick = 0; tick < ticks; tick += 1) {
     const held = await client.readContract({
       address: job.token,
@@ -175,6 +181,7 @@ async function runWatch(config: Config, jobId: string, ticks: number): Promise<v
     });
     const soldNow = result.sells.reduce((acc, s) => acc + s.tokensSold, 0n);
     const quoteNow = result.sells.reduce((acc, s) => acc + s.quoteOut, 0n);
+    soldTotal += soldNow;
     console.log(
       `tick ${tick} m=${Number(result.multipleBps) / 10000}x peak=${Number(result.peakMultipleBps) / 10000}x ` +
         `rule=${result.rule} sold=${soldNow} quote=${eth(quoteNow)}`,
@@ -191,6 +198,25 @@ async function runWatch(config: Config, jobId: string, ticks: number): Promise<v
     });
     if (tick < ticks - 1) await new Promise((r) => setTimeout(r, 5_000));
   }
+  if (soldTotal > 0n) {
+    const forwarded = await forwardToTreasury(client, wallet, config, journal, jobId);
+    console.log('forward           ', forwarded.skipped ?? `${eth(forwarded.amount)} tx ${forwarded.txHash}`);
+  }
+}
+
+async function runForward(config: Config, jobId: string): Promise<void> {
+  const client = makePublicClient(config);
+  await assertChainId(client, config.chainId);
+  if (!config.launcherKey) throw new Error('LAUNCHER_PRIVATE_KEY is required to forward');
+  const wallet = makeWalletClient(config, config.launcherKey);
+  const launcher = privateKeyToAccount(config.launcherKey).address;
+  const journal = new Journal(config.stateDir);
+  journal.create(jobId, { launcher, state: 'HARVESTING' });
+
+  console.log('launcher          ', launcher, eth(await client.getBalance({ address: launcher })));
+  console.log('treasury          ', config.treasury);
+  const result = await forwardToTreasury(client, wallet, config, journal, jobId);
+  console.log('forward           ', result.skipped ?? `${eth(result.amount)} tx ${result.txHash}`);
 }
 
 async function runHarvest(config: Config, jobId: string): Promise<void> {
@@ -265,6 +291,8 @@ async function main(): Promise<void> {
       return runWatch(config, rest[0] ?? '', Number(rest[1] ?? 20));
     case 'harvest':
       return runHarvest(config, rest[0] ?? '');
+    case 'forward':
+      return runForward(config, rest[0] ?? 'forward');
     case 'status':
       return runStatus(config, rest[0]);
     default:
@@ -276,6 +304,7 @@ async function main(): Promise<void> {
           '  launch <sourceToken> [jobId]  clone-launch with an atomic pre-buy',
           '  watch <jobId> [ticks]         run the exit engine',
           '  harvest <jobId>               sweep fees and claim as the delegated recipient',
+          '  forward [jobId]               send launcher balance above the gas reserve to the treasury',
           '  status [jobId]                job and on-chain state',
         ].join('\n'),
       );

@@ -62,6 +62,7 @@ npm run bot -- launch 0x35b8b49c9c4e7a5d08dc1ba0ea5eac0b9937bc83 rh-experiment-1
 DRY_RUN=false npm run bot -- launch 0x35b8b49c9c4e7a5d08dc1ba0ea5eac0b9937bc83 rh-experiment-1
 npm run bot -- watch rh-experiment-1 120
 npm run bot -- harvest rh-experiment-1
+npm run bot -- forward rh-experiment-1
 ```
 
 ## Fee flow
@@ -78,6 +79,16 @@ on them. Sweeping can be signed by the launcher; claiming cannot — the escrow 
 address and pays `msg.sender`, so `CLAIMER_PRIVATE_KEY` must be the delegated wallet itself.
 Without it the bot still sweeps, fees accumulate in the escrow, and they can be claimed by
 hand at any time.
+
+### Treasury forwarding (launcher dust + sale proceeds)
+
+Claims stay manual, but the launcher's own ETH is forwarded automatically: after any tick of
+`watch` that sold tokens, and on demand with `forward [jobId]`, everything above
+`FORWARD_GAS_RESERVE_ETH` (default 0.0003, plus the transfer's own worst-case fee) is sent to
+`TREASURY`. Forwards below `FORWARD_MIN_ETH` (default 0.0005) are skipped so dust is never
+burned on gas. The transfer is a plain native send that the allowlist only accepts when the
+destination is exactly the configured treasury with no calldata; it is journaled like every
+other send and skipped in dry-run.
 
 ## Exit engine
 
@@ -97,7 +108,8 @@ Orders are split into tranches capped at 150 bps of price impact.
 
 - BigInt-only curve math mirroring the contract's integer settlement; no float ever touches a
   `minOut`.
-- Destination + selector allowlist on every signed transaction, plus a per-job value cap.
+- Destination + selector allowlist on every signed transaction, plus a per-job value cap
+  (treasury forwards are the one exempt class, and only as calldata-free sends to `TREASURY`).
 - `eth_call` simulation before every send; chain id asserted against the RPC.
 - Post-launch verification that the factory records the delegated fee recipient — a mismatch
   quarantines the job.

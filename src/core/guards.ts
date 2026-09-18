@@ -30,6 +30,8 @@ export interface TxIntent {
   curve?: Address;
   /** Launched token of the job this transaction belongs to, if any (approvals target it). */
   token?: Address;
+  /** Plain native transfer to the treasury; exempt from the per-job spend cap, nothing else is. */
+  transfer?: boolean;
 }
 
 export class GuardError extends Error {}
@@ -55,6 +57,15 @@ export function assertAllowedTx(config: Config, intent: TxIntent): void {
     if (!ALLOWED_SELECTORS.has(selector)) {
       throw new GuardError(`selector ${selector} is not in the allowlist`);
     }
+  }
+  if (intent.transfer) {
+    if (to !== getAddress(config.treasury)) {
+      throw new GuardError(`transfers may only target the treasury, not ${to}`);
+    }
+    if (intent.data && intent.data !== '0x') {
+      throw new GuardError('treasury transfers must carry no calldata');
+    }
+    return;
   }
   if (intent.value > config.profile.maxJobSpendWei) {
     throw new GuardError(
